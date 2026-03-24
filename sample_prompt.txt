@@ -1,0 +1,3 @@
+Describe the image faithfully.
+Only mention clearly visible entities, actions, and relations.
+Do not guess hidden details or uncertain attributes.
