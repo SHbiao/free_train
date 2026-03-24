@@ -1,0 +1,3 @@
+Describe the image faithfully and conservatively.
+Focus only on clearly visible entities, attributes, actions, text, and spatial relations.
+Avoid hidden intent, uncertain counting, and weak inferences.
