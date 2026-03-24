@@ -19,6 +19,13 @@ STOPWORDS = {
     "under", "near", "some", "several", "many", "much", "very", "more", "most", "can",
     "could", "may", "might", "would", "should", "appears", "seems", "likely", "visible",
 }
+CANDIDATE_ROLE_POOL = [
+    "Focus on the main visible subjects and the clearest explicit action.",
+    "Focus on nearby objects, spatial relations, or direct interactions that have not been mentioned.",
+    "Focus on background details, visible text, clothing, colors, or scene layout that have not been mentioned.",
+    "Focus on carried items, road markings, signs, or other secondary but clearly visible details.",
+    "Focus on the physical environment, barriers, field structures, or ground-level layout that are clearly visible.",
+]
 
 
 class ControllerError(RuntimeError):
@@ -100,7 +107,6 @@ def extract_assistant_answer(text: str) -> str:
     if idx >= 0:
         text = text[idx + len("assistant"):]
     text = text.strip()
-    # Clean common chat wrappers.
     text = re.sub(r"^[:：\-\s]+", "", text)
     return text.strip()
 
@@ -110,8 +116,7 @@ def split_sentences(text: str) -> List[str]:
     if not text:
         return []
     pieces = re.split(r"(?<=[.!?。！？])\s+", text)
-    result = [p.strip() for p in pieces if p.strip()]
-    return result
+    return [p.strip() for p in pieces if p.strip()]
 
 
 def normalize_one_sentence(text: str) -> str:
@@ -138,6 +143,23 @@ def jaccard(a: Sequence[str], b: Sequence[str]) -> float:
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
+
+
+def normalize_duplicate_key(text: str) -> str:
+    text = normalize_one_sentence(text).lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def sentence_similarity(a: str, b: str) -> float:
+    key_a = normalize_duplicate_key(a)
+    key_b = normalize_duplicate_key(b)
+    if not key_a and not key_b:
+        return 1.0
+    if key_a == key_b:
+        return 1.0
+    return jaccard(tokenize_keywords(key_a), tokenize_keywords(key_b))
 
 
 SPECULATIVE_PATTERNS = [
@@ -211,6 +233,7 @@ def should_stop(
     min_score: float,
     min_novel_keywords: int,
     no_new_patience: int,
+    low_novelty_streak: int,
 ) -> Tuple[bool, str]:
     if best_sentence.strip().lower() == "stop":
         return True, "model_stop"
@@ -219,8 +242,7 @@ def should_stop(
     if best_score < min_score:
         return True, "score_below_threshold"
     if best_feats.get("novel_keywords", 0) < min_novel_keywords and accepted:
-        no_new_recent = 1
-        if no_new_recent >= no_new_patience:
+        if low_novelty_streak >= no_new_patience:
             return True, "low_novelty"
     return False, "continue"
 
@@ -235,11 +257,37 @@ def build_round_prompt(base_prompt: str, accepted: Sequence[str], round_idx: int
         f"{accepted_block}\n\n"
         "Instructions:\n"
         "1. Output exactly one next sentence only.\n"
-        "2. Mention only clearly visible objects, attributes, actions, or relations.\n"
+        "2. Mention only clearly visible objects, attributes, actions, text, or spatial relations.\n"
         "3. Do not repeat accepted content.\n"
         "4. Do not speculate or infer hidden intent.\n"
         "5. If no reliable new visual information can be added, output STOP.\n"
         "6. Output plain text only.\n"
+    )
+
+
+def get_candidate_role(candidate_idx: int) -> str:
+    return CANDIDATE_ROLE_POOL[(candidate_idx - 1) % len(CANDIDATE_ROLE_POOL)]
+
+
+def build_candidate_prompt(
+    round_prompt: str,
+    candidate_idx: int,
+    candidates_per_round: int,
+    role_instruction: str,
+    existing_round_candidates: Sequence[str],
+) -> str:
+    existing_block = "\n".join(f"- {s}" for s in existing_round_candidates) if existing_round_candidates else "(none)"
+    return (
+        f"{round_prompt}\n"
+        f"Round candidate index: {candidate_idx} of {candidates_per_round}.\n"
+        f"Candidate role: {role_instruction}\n"
+        "Candidates already generated in this round:\n"
+        f"{existing_block}\n\n"
+        "Extra requirements for this candidate:\n"
+        "1. Make this sentence meaningfully different from the candidates already generated in this round.\n"
+        "2. Do not paraphrase or restate those round candidates.\n"
+        "3. Prefer another visible aspect of the image while staying conservative and faithful.\n"
+        "4. If no distinct reliable sentence is available, output STOP.\n"
     )
 
 
@@ -296,6 +344,85 @@ def cached_generate(
     return payload
 
 
+def is_duplicate_candidate(candidate: str, existing_round_candidates: Sequence[str], threshold: float) -> Tuple[bool, float, str]:
+    if not candidate.strip():
+        return True, 1.0, "empty"
+
+    best_similarity = 0.0
+    best_match = ""
+    cand_key = normalize_duplicate_key(candidate)
+    for prev in existing_round_candidates:
+        prev_key = normalize_duplicate_key(prev)
+        if cand_key == prev_key and cand_key:
+            return True, 1.0, prev
+        sim = sentence_similarity(candidate, prev)
+        if sim > best_similarity:
+            best_similarity = sim
+            best_match = prev
+    return best_similarity >= threshold, best_similarity, best_match
+
+
+def generate_diverse_candidate(
+    client: QwenVLMClient,
+    cache_dir: Path,
+    image_paths: Sequence[Path],
+    round_prompt: str,
+    params: GenerateParams,
+    force: bool,
+    candidate_idx: int,
+    candidates_per_round: int,
+    existing_round_candidates: Sequence[str],
+    accepted: Sequence[str],
+    duplicate_similarity_threshold: float,
+    max_candidate_attempts: int,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    role_instruction = get_candidate_role(candidate_idx)
+    attempt_rows: List[Dict[str, Any]] = []
+
+    for attempt_idx in range(1, max_candidate_attempts + 1):
+        candidate_prompt = build_candidate_prompt(
+            round_prompt=round_prompt,
+            candidate_idx=candidate_idx,
+            candidates_per_round=candidates_per_round,
+            role_instruction=role_instruction,
+            existing_round_candidates=existing_round_candidates,
+        )
+        payload = cached_generate(
+            client=client,
+            cache_dir=cache_dir,
+            image_paths=image_paths,
+            prompt=candidate_prompt,
+            params=params,
+            force=force,
+        )
+        answer = payload.get("answer", "")
+        score, feats = sentence_score(answer, accepted)
+        is_dup, dup_sim, dup_match = is_duplicate_candidate(answer, existing_round_candidates, duplicate_similarity_threshold)
+        row = {
+            "candidate_idx": candidate_idx,
+            "attempt_idx": attempt_idx,
+            "role": role_instruction,
+            "answer": answer,
+            "score": score,
+            "features": feats,
+            "elapsed_sec": payload.get("elapsed_sec"),
+            "cached": payload.get("cached", False),
+            "duplicate_within_round": is_dup,
+            "duplicate_similarity": round(float(dup_sim), 4),
+            "duplicate_match": dup_match,
+        }
+        attempt_rows.append(row)
+
+        if answer.strip().lower() == "stop":
+            return row, attempt_rows
+        if not is_dup:
+            return row, attempt_rows
+
+    best_attempt = max(attempt_rows, key=lambda x: float(x.get("score") or -999.0))
+    best_attempt = {**best_attempt, "fallback_after_max_attempts": True}
+    return best_attempt, attempt_rows
+
+
 def run_controlled_generation(
     client: QwenVLMClient,
     image_paths: Sequence[Path],
@@ -307,6 +434,8 @@ def run_controlled_generation(
     min_score: float,
     min_novel_keywords: int,
     no_new_patience: int,
+    duplicate_similarity_threshold: float,
+    max_candidate_attempts: int,
     force: bool,
 ) -> Dict[str, Any]:
     round_cache = run_dir / "round_cache"
@@ -317,6 +446,7 @@ def run_controlled_generation(
     accepted: List[str] = []
     total_elapsed = 0.0
     stop_reason = "max_sentences"
+    low_novelty_streak = 0
 
     for round_idx in range(1, max_sentences + 1):
         round_prompt = build_round_prompt(base_prompt, accepted, round_idx)
@@ -326,32 +456,36 @@ def run_controlled_generation(
 
         candidates: List[Dict[str, Any]] = []
         for cand_idx in range(1, candidates_per_round + 1):
-            payload = cached_generate(
+            existing_round_answers = [row["answer"] for row in candidates if row.get("answer")]
+            chosen_row, attempt_rows = generate_diverse_candidate(
                 client=client,
                 cache_dir=round_cache,
                 image_paths=image_paths,
-                prompt=round_prompt,
+                round_prompt=round_prompt,
                 params=params,
                 force=force,
+                candidate_idx=cand_idx,
+                candidates_per_round=candidates_per_round,
+                existing_round_candidates=existing_round_answers,
+                accepted=accepted,
+                duplicate_similarity_threshold=duplicate_similarity_threshold,
+                max_candidate_attempts=max_candidate_attempts,
             )
-            answer = payload.get("answer", "")
-            score, feats = sentence_score(answer, accepted)
+            for row in attempt_rows:
+                append_jsonl(round_dir / "candidate_attempts.jsonl", row)
+                total_elapsed += float(row.get("elapsed_sec") or 0.0)
+
             candidate_row = {
-                "candidate_idx": cand_idx,
-                "answer": answer,
-                "score": score,
-                "features": feats,
-                "elapsed_sec": payload.get("elapsed_sec"),
-                "cached": payload.get("cached", False),
+                **chosen_row,
+                "attempt_count": len(attempt_rows),
+                "rejected_duplicate_attempts": sum(1 for row in attempt_rows[:-1] if row.get("duplicate_within_round")),
             }
             candidates.append(candidate_row)
             append_jsonl(round_dir / "candidates.jsonl", candidate_row)
-            total_elapsed += float(payload.get("elapsed_sec") or 0.0)
 
-        # Deduplicate after scoring so repeated API outputs do not dominate.
         unique_candidates: Dict[str, Dict[str, Any]] = {}
         for row in candidates:
-            key = row["answer"].strip().lower()
+            key = normalize_duplicate_key(row["answer"])
             if key not in unique_candidates or row["score"] > unique_candidates[key]["score"]:
                 unique_candidates[key] = row
         ranked = sorted(unique_candidates.values(), key=lambda x: x["score"], reverse=True)
@@ -363,6 +497,11 @@ def run_controlled_generation(
         (round_dir / "best.json").write_text(json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8")
         save_text(round_dir / "best.txt", best["answer"])
 
+        if best["features"].get("novel_keywords", 0) < min_novel_keywords and accepted:
+            low_novelty_streak += 1
+        else:
+            low_novelty_streak = 0
+
         stop, stop_reason = should_stop(
             accepted=accepted,
             best_sentence=best["answer"],
@@ -373,6 +512,7 @@ def run_controlled_generation(
             min_score=min_score,
             min_novel_keywords=min_novel_keywords,
             no_new_patience=no_new_patience,
+            low_novelty_streak=low_novelty_streak,
         )
 
         round_summary = {
@@ -381,6 +521,7 @@ def run_controlled_generation(
             "stop": stop,
             "stop_reason": stop_reason,
             "accepted_before": list(accepted),
+            "low_novelty_streak": low_novelty_streak,
         }
         (round_dir / "round_summary.json").write_text(
             json.dumps(round_summary, ensure_ascii=False, indent=2),
@@ -410,6 +551,8 @@ def run_controlled_generation(
             "min_score": min_score,
             "min_novel_keywords": min_novel_keywords,
             "no_new_patience": no_new_patience,
+            "duplicate_similarity_threshold": duplicate_similarity_threshold,
+            "max_candidate_attempts": max_candidate_attempts,
         },
     }
     (run_dir / "final_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -440,6 +583,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-score", type=float, default=1.0)
     parser.add_argument("--min-novel-keywords", type=int, default=1)
     parser.add_argument("--no-new-patience", type=int, default=1)
+    parser.add_argument("--duplicate-similarity-threshold", type=float, default=0.72)
+    parser.add_argument("--max-candidate-attempts", type=int, default=4)
     return parser.parse_args()
 
 
@@ -486,6 +631,8 @@ def main() -> None:
                     "min_score": args.min_score,
                     "min_novel_keywords": args.min_novel_keywords,
                     "no_new_patience": args.no_new_patience,
+                    "duplicate_similarity_threshold": args.duplicate_similarity_threshold,
+                    "max_candidate_attempts": args.max_candidate_attempts,
                 },
                 "as_multi_image": args.as_multi_image,
                 "recursive": args.recursive,
@@ -514,6 +661,8 @@ def main() -> None:
                 min_score=args.min_score,
                 min_novel_keywords=args.min_novel_keywords,
                 no_new_patience=args.no_new_patience,
+                duplicate_similarity_threshold=args.duplicate_similarity_threshold,
+                max_candidate_attempts=args.max_candidate_attempts,
                 force=args.force,
             )
             row = {

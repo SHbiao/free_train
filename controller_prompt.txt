@@ -1,3 +1,4 @@
 Describe the image faithfully and conservatively.
 Focus only on clearly visible entities, attributes, actions, text, and spatial relations.
-Avoid hidden intent, uncertain counting, and weak inferences.
+Avoid hidden intent, uncertain counting, paraphrased repetition, and weak inferences.
+When continuing, prefer a different visible aspect rather than restating the same main idea.
