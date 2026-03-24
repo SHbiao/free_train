@@ -1,0 +1,27 @@
+在 D:\all_code\free_train 目录下运行。
+
+1) One-shot baseline（单图/批量都可）
+python run_local_infer.py images --prompt-file sample_prompt.txt --recursive --run-name oneshot_baseline
+
+2) Controlled fixed-2（固定最多2句）
+python controller_generate.py images --prompt-file controller_prompt.txt --recursive --do-sample --candidates-per-round 3 --max-sentences 2 --max-new-tokens 96 --temperature 0.95 --top-p 0.95 --top-k 80 --run-name controlled_fixed2
+
+3) Controlled fixed-3（固定最多3句）
+python controller_generate.py images --prompt-file controller_prompt.txt --recursive --do-sample --candidates-per-round 3 --max-sentences 3 --max-new-tokens 96 --temperature 0.95 --top-p 0.95 --top-k 80 --run-name controlled_fixed3
+
+4) Controlled diverse-3（你当前主方法的默认版）
+python controller_generate.py images --prompt-file controller_prompt.txt --recursive --do-sample --candidates-per-round 3 --max-sentences 3 --max-new-tokens 96 --temperature 0.95 --top-p 0.95 --top-k 80 --run-name controlled_diverse3 --force
+
+5) Dynamic-stop 尝试版（先做试验，不一定是最终参数）
+python controller_generate.py images --prompt-file controller_prompt.txt --recursive --do-sample --candidates-per-round 3 --max-sentences 4 --max-new-tokens 96 --temperature 0.95 --top-p 0.95 --top-k 80 --min-score 2.2 --min-novel-keywords 2 --no-new-patience 1 --run-name controlled_dynamic_try --force
+
+6) 评估 one-shot 结果
+python evaluate_results.py vlm_cache\runs\oneshot_baseline --project-root . --yolo-repo .\ultralytics-main --yolo-weights .\weight\yolo26n.pt
+
+7) 评估 controlled 结果
+python evaluate_results.py vlm_control_cache\runs\controlled_fixed3 --project-root . --yolo-repo .\ultralytics-main --yolo-weights .\weight\yolo26n.pt
+python evaluate_results.py vlm_control_cache\runs\controlled_fixed2 --project-root . --yolo-repo .\ultralytics-main --yolo-weights .\weight\yolo26n.pt
+python evaluate_results.py vlm_control_cache\runs\controlled_dynamic_try --project-root . --yolo-repo .\ultralytics-main --yolo-weights .\weight\yolo26n.pt
+python evaluate_results.py D:\all_code\free_train\vlm_cache\runs\oneshot_baseline --project-root . --yolo-repo .\ultralytics-main --yolo-weights .\weight\yolo26n.pt
+8) 如果你想带上 CLIP 分数（前提是本地 CLIP 可正常 import 且模型权重可用）
+python evaluate_results.py vlm_control_cache\runs\controlled_fixed3 --project-root . --yolo-repo .\ultralytics-main --yolo-weights .\weight\yolo26n.pt --enable-clip --clip-repo .\CLIP-main --clip-device cuda
