@@ -18,3 +18,11 @@ python controller_generate.py images\s3.jpg --prompt-file controller_prompt.txt 
 
 
 """
+
+
+
+"""
+    Yolo-world实体测试
+    python open_vocab_verifier.py images\s3.jpg --entities person umbrella crosswalk fence field arrow --project-root . --yolo-repo .\ultralytics-main --yolo-weights .\weight\yolov8s-world.pt
+
+"""
